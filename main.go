@@ -12,11 +12,16 @@ import (
 	"time"
 )
 
+// Встраиваем бинарники прямо в ваш итоговый клиппер
+//
 //go:embed yt-dlp.exe
 var ytdlpBytes []byte
 
 //go:embed ffmpeg.exe
 var ffmpegBytes []byte
+
+//go:embed deno.exe
+var denoBytes []byte
 
 type LogEntry struct {
 	ID    int    `json:"id"`
@@ -25,7 +30,6 @@ type LogEntry struct {
 	URL   string `json:"url"`
 }
 
-// Структура для десериализации метаданных из yt-dlp
 type VideoMetadata struct {
 	Title string `json:"title"`
 }
@@ -62,10 +66,15 @@ func appendHistory(title, url string) {
 	_ = os.WriteFile(jsonFile, data, 0644)
 }
 
-// Парсинг метаданных через JSON-дамп для полной поддержки кириллицы
-func downloadAndGetTitle(ytdlpPath, url string) (string, error) {
-	// Безопасный запрос метаданных в формате JSON
-	cmdTitle := exec.Command(ytdlpPath, "--dump-json", url)
+// Парсинг метаданных и скачивание с поддержкой JS-рантайма и FFmpeg
+func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url string) (string, error) {
+
+	// 1. Безопасный запрос метаданных (передаем рантайтм deno, чтобы не было ошибки "not available")
+	cmdTitle := exec.Command(ytdlpPath,
+		"--js-runtimes", "deno:"+denoPath,
+		"--dump-json",
+		url,
+	)
 	var outTitle bytes.Buffer
 	cmdTitle.Stdout = &outTitle
 
@@ -77,8 +86,11 @@ func downloadAndGetTitle(ytdlpPath, url string) (string, error) {
 		}
 	}
 
-	// Инициализация основного процесса загрузки
+	// 2. Инициализация основного процесса загрузки
+	// Добавили: --ffmpeg-location для склейки и --js-runtimes для обхода защиты
 	cmd := exec.Command(ytdlpPath,
+		"--js-runtimes", "deno:"+denoPath,
+		"--ffmpeg-location", ffmpegDir,
 		"-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best",
 		"--merge-output-format", "mp4",
 		"-o", "Downloads/%(title)s.%(ext)s",
@@ -93,21 +105,27 @@ func downloadAndGetTitle(ytdlpPath, url string) (string, error) {
 }
 
 func main() {
+	// Создаем временную папку в Temp
 	tempDir := filepath.Join(os.TempDir(), "phonker_loader")
 	_ = os.MkdirAll(tempDir, os.ModePerm)
 
 	ytdlpPath := filepath.Join(tempDir, "yt-dlp.exe")
 	ffmpegPath := filepath.Join(tempDir, "ffmpeg.exe")
+	denoPath := filepath.Join(tempDir, "deno.exe")
 
+	// Распаковываем все три бинарника во временную директорию
 	_ = os.WriteFile(ytdlpPath, ytdlpBytes, 0755)
 	_ = os.WriteFile(ffmpegPath, ffmpegBytes, 0755)
+	_ = os.WriteFile(denoPath, denoBytes, 0755)
 
+	// Подчищаем за собой при выходе из программы
 	defer os.Remove(ytdlpPath)
 	defer os.Remove(ffmpegPath)
+	defer os.Remove(denoPath)
 
 	for {
 		fmt.Println("\n=======================================")
-		fmt.Println("    YOUTUBE DOWNLOADER BY PHONKER     ")
+		fmt.Println("     YOUTUBE DOWNLOADER BY PHONKER     ")
 		fmt.Println("=======================================")
 		fmt.Println("[1] Download Video")
 		fmt.Println("[2] Open Downloads Directory")
@@ -133,7 +151,9 @@ func main() {
 			}
 
 			fmt.Println("\n[INFO] Fetching video metadata via JSON dump...")
-			videoTitle, err := downloadAndGetTitle(ytdlpPath, url)
+
+			// Передаем tempDir (где лежит ffmpeg) и путь к denoPath
+			videoTitle, err := downloadAndGetTitle(ytdlpPath, tempDir, denoPath, url)
 
 			if err != nil {
 				fmt.Printf("\n[ERROR] Task failed: %v\n", err)
