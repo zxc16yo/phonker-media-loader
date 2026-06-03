@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	_ "embed"
 	"encoding/json"
@@ -12,8 +13,6 @@ import (
 	"time"
 )
 
-// Встраиваем бинарники прямо в ваш итоговый клиппер
-//
 //go:embed yt-dlp.exe
 var ytdlpBytes []byte
 
@@ -66,10 +65,7 @@ func appendHistory(title, url string) {
 	_ = os.WriteFile(jsonFile, data, 0644)
 }
 
-// Парсинг метаданных и скачивание с поддержкой JS-рантайма и FFmpeg
-func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url string) (string, error) {
-
-	// 1. Безопасный запрос метаданных (передаем рантайтм deno, чтобы не было ошибки "not available")
+func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url, quality, timeRange string) (string, error) {
 	cmdTitle := exec.Command(ytdlpPath,
 		"--js-runtimes", "deno:"+denoPath,
 		"--dump-json",
@@ -78,7 +74,7 @@ func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url string) (string, er
 	var outTitle bytes.Buffer
 	cmdTitle.Stdout = &outTitle
 
-	title := "Unknown YouTube Video"
+	title := "Unknown"
 	if err := cmdTitle.Run(); err == nil {
 		var meta VideoMetadata
 		if err := json.Unmarshal(outTitle.Bytes(), &meta); err == nil && meta.Title != "" {
@@ -86,17 +82,37 @@ func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url string) (string, er
 		}
 	}
 
-	// 2. Инициализация основного процесса загрузки
-	// Добавили: --ffmpeg-location для склейки и --js-runtimes для обхода защиты
-	cmd := exec.Command(ytdlpPath,
-		"--js-runtimes", "deno:"+denoPath,
-		"--ffmpeg-location", ffmpegDir,
-		"-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best",
-		"--merge-output-format", "mp4",
-		"-o", "Downloads/%(title)s.%(ext)s",
-		url,
-	)
+	formatArg := "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best"
+	switch quality {
+	case "1080":
+		formatArg = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/best"
+	case "720":
+		formatArg = "bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/best"
+	case "480":
+		formatArg = "bv*[height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/best"
+	case "360":
+		formatArg = "bv*[height<=360][ext=mp4]+ba[ext=m4a]/bv*[height<=360]+ba/best"
+	}
 
+	args := []string{
+		"--js-runtimes", "deno:" + denoPath,
+		"--ffmpeg-location", ffmpegDir,
+		"-f", formatArg,
+		"--merge-output-format", "mp4",
+		"--force-keyframes-at-cuts",
+		"--downloader-args", "ffmpeg:-loglevel warning",
+	}
+
+	if timeRange != "" {
+		args = append(args, "--download-sections", timeRange)
+		args = append(args, "-o", "Downloads/%(title)s [Fragment].%(ext)s")
+	} else {
+		args = append(args, "-o", "Downloads/%(title)s.%(ext)s")
+	}
+
+	args = append(args, url)
+
+	cmd := exec.Command(ytdlpPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -104,8 +120,13 @@ func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url string) (string, er
 	return title, err
 }
 
+func openDownloads() {
+	downloadsPath := "Downloads"
+	_ = os.MkdirAll(downloadsPath, os.ModePerm)
+	_ = exec.Command("explorer", downloadsPath).Start()
+}
+
 func main() {
-	// Создаем временную папку в Temp
 	tempDir := filepath.Join(os.TempDir(), "phonker_loader")
 	_ = os.MkdirAll(tempDir, os.ModePerm)
 
@@ -113,85 +134,120 @@ func main() {
 	ffmpegPath := filepath.Join(tempDir, "ffmpeg.exe")
 	denoPath := filepath.Join(tempDir, "deno.exe")
 
-	// Распаковываем все три бинарника во временную директорию
 	_ = os.WriteFile(ytdlpPath, ytdlpBytes, 0755)
 	_ = os.WriteFile(ffmpegPath, ffmpegBytes, 0755)
 	_ = os.WriteFile(denoPath, denoBytes, 0755)
 
-	// Подчищаем за собой при выходе из программы
 	defer os.Remove(ytdlpPath)
 	defer os.Remove(ffmpegPath)
 	defer os.Remove(denoPath)
 
-	for {
-		fmt.Println("\n=======================================")
-		fmt.Println("     YOUTUBE DOWNLOADER BY PHONKER     ")
-		fmt.Println("=======================================")
-		fmt.Println("[1] Download Video")
-		fmt.Println("[2] Open Downloads Directory")
-		fmt.Println("[3] Show Download History")
-		fmt.Println("[4] Exit")
-		fmt.Println("=======================================")
+	reader := bufio.NewReader(os.Stdin)
 
-		var choice string
-		fmt.Print("Enter option (1-4): ")
-		fmt.Scanln(&choice)
+	for {
+		fmt.Println("\n--- MENU ---")
+		fmt.Println("[1] Скачать видео")
+		fmt.Println("[2] Открыть папку")
+		fmt.Println("[3] История")
+		fmt.Println("[4] Выход")
+
+		fmt.Print("\nВведите номер действия: ")
+		choice, _ := reader.ReadString('\n')
 		choice = strings.TrimSpace(choice)
 
 		switch choice {
 		case "1":
-			var url string
-			fmt.Print("\nEnter YouTube URL: ")
-			fmt.Scanln(&url)
+			fmt.Print("\nВведите URL: ")
+			url, _ := reader.ReadString('\n')
 			url = strings.TrimSpace(url)
 
 			if url == "" {
-				fmt.Println("Error: URL cannot be empty.")
+				fmt.Println("Ошибка: пустой ввод.")
 				continue
 			}
 
-			fmt.Println("\n[INFO] Fetching video metadata via JSON dump...")
+			fmt.Println("\nКачество:")
+			fmt.Println("[1] Максимальное")
+			fmt.Println("[2] 1080p")
+			fmt.Println("[3] 720p")
+			fmt.Println("[4] 480p")
+			fmt.Println("[5] 360p")
+			fmt.Print("Введите номер: ")
+			qChoice, _ := reader.ReadString('\n')
+			qChoice = strings.TrimSpace(qChoice)
 
-			// Передаем tempDir (где лежит ffmpeg) и путь к denoPath
-			videoTitle, err := downloadAndGetTitle(ytdlpPath, tempDir, denoPath, url)
+			quality := "best"
+			switch qChoice {
+			case "2":
+				quality = "1080"
+			case "3":
+				quality = "720"
+			case "4":
+				quality = "480"
+			case "5":
+				quality = "360"
+			}
+
+			fmt.Println("\nРежим:")
+			fmt.Println("[1] Полное видео")
+			fmt.Println("[2] Фрагмент")
+			fmt.Print("Введите номер: ")
+			tChoice, _ := reader.ReadString('\n')
+			tChoice = strings.TrimSpace(tChoice)
+
+			timeRange := ""
+			if tChoice == "2" {
+				fmt.Println("\nФормат: ЧЧ:ММ:СС, ММ:СС или секунды")
+				fmt.Print("Старт: ")
+				start, _ := reader.ReadString('\n')
+				start = strings.TrimSpace(start)
+
+				fmt.Print("Конец: ")
+				end, _ := reader.ReadString('\n')
+				end = strings.TrimSpace(end)
+
+				if start != "" && end != "" {
+					timeRange = fmt.Sprintf("*%s-%s", start, end)
+				} else {
+					fmt.Println("Ошибка: тайм-коды не указаны. Загрузка полного видео.")
+				}
+			}
+
+			fmt.Println("\nЗагрузка...")
+
+			videoTitle, err := downloadAndGetTitle(ytdlpPath, tempDir, denoPath, url, quality, timeRange)
 
 			if err != nil {
-				fmt.Printf("\n[ERROR] Task failed: %v\n", err)
+				fmt.Printf("\nОшибка: %v\n", err)
 			} else {
-				fmt.Printf("[INFO] Target resolved successfully.\n")
-				fmt.Println("[SUCCESS] Download completed.")
+				fmt.Println("\nГотово.")
+				if timeRange != "" {
+					videoTitle = videoTitle + " [Fragment]"
+				}
 				appendHistory(videoTitle, url)
+				openDownloads()
 			}
 
 		case "2":
-			downloadsPath := "Downloads"
-			_ = os.MkdirAll(downloadsPath, os.ModePerm)
-			err := exec.Command("explorer", downloadsPath).Start()
-			if err != nil {
-				fmt.Printf("[ERROR] Failed to open directory: %v\n", err)
-			} else {
-				fmt.Println("[INFO] Opening Downloads folder...")
-			}
+			openDownloads()
 
 		case "3":
-			fmt.Println("\n=== DOWNLOAD HISTORY ===")
+			fmt.Println("\n--- ИСТОРИЯ ---")
 			history := readHistory()
 			if len(history) == 0 {
-				fmt.Println("History log is empty.")
+				fmt.Println("История пуста.")
 			} else {
 				for i := len(history) - 1; i >= 0; i-- {
-					fmt.Printf("[%d] %s\n    Title: %s\n    URL:   %s\n\n",
+					fmt.Printf("ID %d | %s | %s\nURL: %s\n\n",
 						history[i].ID, history[i].Date, history[i].Title, history[i].URL)
 				}
 			}
-			fmt.Println("========================")
 
 		case "4":
-			fmt.Println("\nTerminating process...")
 			return
 
 		default:
-			fmt.Println("[ERROR] Invalid option selected.")
+			fmt.Println("Ошибка: неверный ввод.")
 		}
 	}
 }
