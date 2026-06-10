@@ -29,6 +29,7 @@ var denoBytes []byte
 type LogEntry struct {
 	ID    int    `json:"id"`
 	Date  string `json:"date"`
+	Time  string `json:"time"`
 	Title string `json:"title"`
 	URL   string `json:"url"`
 }
@@ -38,23 +39,41 @@ type VideoMetadata struct {
 	Duration float64 `json:"duration"`
 }
 
-// Глобальная переменная для хранения истории в оперативной памяти
-var memoryHistory []LogEntry
+const historyFilePath = "Downloads/history.json"
 
-func appendHistory(title, url string) {
-	newID := 1
-	if len(memoryHistory) > 0 {
-		newID = memoryHistory[len(memoryHistory)-1].ID + 1
+func readHistoryFromFile() []LogEntry {
+	_ = os.MkdirAll("Downloads", os.ModePerm)
+	var list []LogEntry
+	data, err := os.ReadFile(historyFilePath)
+	if err != nil {
+		return list
 	}
+	_ = json.Unmarshal(data, &list)
+	return list
+}
 
+func appendHistoryDirectly(title, url string) {
+	_ = os.MkdirAll("Downloads", os.ModePerm)
+	currentEntries := readHistoryFromFile()
+	newID := 1
+	if len(currentEntries) > 0 {
+		newID = currentEntries[len(currentEntries)-1].ID + 1
+	}
 	newEntry := LogEntry{
 		ID:    newID,
-		Date:  time.Now().Format("2006-01-02 15:04:05"),
+		Date:  time.Now().Format("2006-01-02"),
+		Time:  time.Now().Format("15:04:05"),
 		Title: title,
 		URL:   url,
 	}
-
-	memoryHistory = append(memoryHistory, newEntry)
+	currentEntries = append(currentEntries, newEntry)
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(currentEntries); err == nil {
+		_ = os.WriteFile(historyFilePath, buf.Bytes(), 0644)
+	}
 }
 
 func startSpinner(message string, stopChan chan bool, wg *sync.WaitGroup) {
@@ -87,122 +106,88 @@ func formatSeconds(seconds float64) string {
 	m := d / time.Minute
 	d -= m * time.Minute
 	s := d / time.Second
-
 	if h > 0 {
 		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 	}
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
-func downloadAndGetTitle(ytdlpPath, ffmpegDir, denoPath, url, quality, timeRange string) (string, string, error) {
-	title := "Unknown"
-	var duration float64 = 0
-	detectedBrowser := ""
-	useCookieFile := false
+func normalizeTime(t string) string {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return ""
+	}
+	if t == "0" || t == "00" || t == "0:00" || t == "00:00" || t == "00:00:00" {
+		return "00:00:00"
+	}
+	parts := strings.Split(t, ":")
+	if len(parts) == 1 {
+		var s int
+		fmt.Sscanf(parts[0], "%d", &s)
+		return fmt.Sprintf("%02d:%02d:%02d", s/3600, (s%3600)/60, s%60)
+	}
+	if len(parts) == 2 {
+		return fmt.Sprintf("00:%02s:%02s", parts[0], parts[1])
+	}
+	if len(parts) == 3 {
+		return fmt.Sprintf("%02s:%02s:%02s", parts[0], parts[1], parts[2])
+	}
+	return t
+}
 
+func downloadVideo(ytdlpPath, ffmpegDir, denoPath, url, quality, startTime, endTime string) (string, error) {
+	useCookieFile := false
 	if _, err := os.Stat("cookies.txt"); err == nil {
 		useCookieFile = true
 	}
 
 	isYoutube := strings.Contains(url, "youtube.com") || strings.Contains(url, "youtu.be")
 
-	if timeRange != "GET_INFO_ONLY" {
-		goto skipMetadata
+	stopSpinnerChan := make(chan bool)
+	var spinnerWg sync.WaitGroup
+	startSpinner("Проверка ссылки и получение метаданных видео...", stopSpinnerChan, &spinnerWg)
+
+	argsTitle := []string{}
+	if isYoutube {
+		argsTitle = append(argsTitle, "--js-runtimes", "deno:"+denoPath)
 	}
+	argsTitle = append(argsTitle, "--dump-json")
+	if isYoutube {
+		argsTitle = append(argsTitle, "--extractor-args", "youtube:player-client=android,web_embedded")
+	}
+	if useCookieFile {
+		argsTitle = append(argsTitle, "--cookies", "cookies.txt")
+	} else {
+		argsTitle = append(argsTitle, "--cookies-from-browser", "chrome,brave,firefox,edge,opera,vivaldi")
+	}
+	argsTitle = append(argsTitle, url)
 
-	{
-		stopSpinnerChan := make(chan bool)
-		var spinnerWg sync.WaitGroup
-		startSpinner("Получение метаданных видео и обход защиты...", stopSpinnerChan, &spinnerWg)
-
-		argsTitle := []string{"--dump-json", url}
-		if isYoutube {
-			argsTitle = append(argsTitle, "--extractor-args", "youtube:player-client=android,web_embedded")
-		}
-
-		if useCookieFile {
-			argsTitle = append(argsTitle, "--cookies", "cookies.txt")
-		} else {
-			browsers := []string{"brave", "chrome", "opera", "firefox", "edge", "vivaldi"}
-			for _, br := range browsers {
-				testArgs := []string{"--cookies-from-browser", br, "--dump-json", url}
-				if isYoutube {
-					testArgs = append([]string{
-						"--js-runtimes", "deno:" + denoPath,
-						"--extractor-args", "youtube:player-client=android,web_embedded",
-					}, testArgs...)
-				}
-
-				cmdTest := exec.Command(ytdlpPath, testArgs...)
-				var outTest bytes.Buffer
-				cmdTest.Stdout = &outTest
-				cmdTest.Stderr = nil
-
-				if err := cmdTest.Run(); err == nil {
-					var meta VideoMetadata
-					if err := json.Unmarshal(outTest.Bytes(), &meta); err == nil && meta.Title != "" {
-						title = meta.Title
-						duration = meta.Duration
-						detectedBrowser = br
-						break
-					}
-				}
-			}
-		}
-
-		if title == "Unknown" {
-			cmdTitleArgs := argsTitle
-			if isYoutube {
-				cmdTitleArgs = append([]string{"--js-runtimes", "deno:" + denoPath}, cmdTitleArgs...)
-			}
-			cmdTitle := exec.Command(ytdlpPath, cmdTitleArgs...)
-			var outTitle bytes.Buffer
-			cmdTitle.Stdout = &outTitle
-			cmdTitle.Stderr = nil
-
-			if err := cmdTitle.Run(); err == nil {
-				var meta VideoMetadata
-				if err := json.Unmarshal(outTitle.Bytes(), &meta); err == nil && meta.Title != "" {
-					title = meta.Title
-					duration = meta.Duration
-				}
-			}
-		}
-
+	cmdTitle := exec.Command(ytdlpPath, argsTitle...)
+	var outTitle bytes.Buffer
+	cmdTitle.Stdout = &outTitle
+	if err := cmdTitle.Run(); err != nil {
 		stopSpinnerChan <- true
 		spinnerWg.Wait()
-
-		if title == "Unknown" && isYoutube {
-			title = "YouTube Video [Age Restricted]"
-		}
-
-		if detectedBrowser != "" {
-			fmt.Printf("\nАвторизация успешна через профиль браузера: %s\n", detectedBrowser)
-		} else {
-			fmt.Println()
-		}
-		fmt.Printf("Название видео: \"%s\"\n", title)
-
-		return title, formatSeconds(duration), nil
+		return "", fmt.Errorf("видео недоступно или ссылка неверная")
 	}
 
-skipMetadata:
+	var meta VideoMetadata
+	_ = json.Unmarshal(outTitle.Bytes(), &meta)
+	stopSpinnerChan <- true
+	spinnerWg.Wait()
+
+	if meta.Title == "" {
+		meta.Title = "Downloaded_Video"
+	}
+	fmt.Printf("\nНазвание видео: \"%s\" [%s]\n", meta.Title, formatSeconds(meta.Duration))
+
+	safeTitle := meta.Title
+	for _, char := range []string{"<", ">", ":", "\"", "/", "\\", "|", "?", "*"} {
+		safeTitle = strings.ReplaceAll(safeTitle, char, "")
+	}
 
 	formatArg := "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/best"
-	if strings.Contains(url, "twitch.tv") {
-		switch quality {
-		case "1080":
-			formatArg = "1080p/1080p60/best"
-		case "720":
-			formatArg = "720p/720p60/720p30"
-		case "480":
-			formatArg = "480p/480p30"
-		case "360":
-			formatArg = "360p/360p30"
-		default:
-			formatArg = "best/source"
-		}
-	} else {
+	if !strings.Contains(url, "twitch.tv") {
 		switch quality {
 		case "1080":
 			formatArg = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/best"
@@ -215,89 +200,63 @@ skipMetadata:
 		}
 	}
 
-	args := []string{
+	args := []string{}
+	if isYoutube {
+		args = append(args, "--js-runtimes", "deno:"+denoPath)
+	}
+
+	args = append(args,
 		"--ffmpeg-location", ffmpegDir,
 		"-f", formatArg,
-		"--merge-output-format", "mp4",
 		"--force-ipv4",
 		"--no-warnings",
-		"--socket-timeout", "60",
-
 		"--quiet",
-		"--progress",
-		"--progress-template", "\r[download] %(progress._percent_str)s | Вес: %(progress._total_bytes_str)s | Скорость: %(progress._speed_str)s | Прошло времени: %(progress._elapsed_str)s",
-	}
+		"--merge-output-format", "mp4",
+	)
 
 	if isYoutube {
 		args = append(args, "--extractor-args", "youtube:player-client=android,web_embedded")
 	}
-
-	isFragment := timeRange != ""
-	_ = os.MkdirAll("Downloads", os.ModePerm)
-
-	if isFragment {
-		fmt.Println("Инициализация нарезки фрагмента...")
-		fmt.Println("Внимание: на длинных видео спиннер будет крутиться до завершения кэширования.")
-
-		args = append(args, "--download-sections", timeRange)
-		args = append(args, "-o", "Downloads/%(title)s [Fragment].%(ext)s")
-		args = append(args, "--downloader-args", "ffmpeg_i:-seekable 0")
-		args = append(args, "--downloader-args", "ffmpeg:-loglevel warning")
-		args = append(args, "--concurrent-fragments", "1")
-	} else {
-		fmt.Println("Скачивание полного видео...")
-		args = append(args, "-o", "Downloads/%(title)s.%(ext)s")
-		args = append(args, "--downloader-args", "ffmpeg:-loglevel warning")
-		args = append(args, "--concurrent-fragments", "4")
-	}
-
 	if useCookieFile {
 		args = append(args, "--cookies", "cookies.txt")
 	} else {
 		args = append(args, "--cookies-from-browser", "chrome,brave,firefox,edge,opera,vivaldi")
 	}
 
-	if isYoutube {
-		args = append([]string{"--js-runtimes", "deno:" + denoPath}, args...)
+	_ = os.MkdirAll("Downloads", os.ModePerm)
+
+	stopDownloadSpinner := make(chan bool)
+	var downloadSpinnerWg sync.WaitGroup
+
+	// Если startTime заполнена (не пустая строка) — это ВСЕГДА нарезка фрагмента
+	if startTime != "" {
+		startSpinner("Выполняется загрузка и нарезка фрагмента потока...", stopDownloadSpinner, &downloadSpinnerWg)
+		args = append(args, "--downloader", "ffmpeg")
+		args = append(args, "--downloader-args", fmt.Sprintf("ffmpeg:-ss %s -to %s", startTime, endTime))
+		args = append(args, "-o", filepath.Join("Downloads", safeTitle+" [Fragment].%(ext)s"))
+	} else {
+		// Оставили пустым -> качаем всё
+		startSpinner("Выполняется скачивание полного видео...", stopDownloadSpinner, &downloadSpinnerWg)
+		args = append(args, "--concurrent-fragments", "4")
+		args = append(args, "-o", filepath.Join("Downloads", safeTitle+".%(ext)s"))
 	}
 
 	args = append(args, url)
+
 	cmd := exec.Command(ytdlpPath, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 
-	if isFragment {
-		stopDownloadSpinner := make(chan bool)
-		var downloadSpinnerWg sync.WaitGroup
-		startSpinner("Обработка и загрузка фрагмента потока...", stopDownloadSpinner, &downloadSpinnerWg)
+	err := cmd.Run()
 
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		err := cmd.Run()
+	stopDownloadSpinner <- true
+	downloadSpinnerWg.Wait()
 
-		stopDownloadSpinner <- true
-		downloadSpinnerWg.Wait()
-		return "", "", err
-	} else {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Run()
-
-		if err == nil {
-			fmt.Println()
-		}
-		return "", "", err
+	if err != nil {
+		return meta.Title, fmt.Errorf("ошибка во время загрузки: %v", err)
 	}
-}
 
-func openDownloads() {
-	downloadsPath := "Downloads"
-	_ = os.MkdirAll(downloadsPath, os.ModePerm)
-	_ = exec.Command("explorer", downloadsPath).Start()
-}
-
-func writeEmbeddedFile(path string, data []byte) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		_ = os.WriteFile(path, data, 0755)
-	}
+	return meta.Title, nil
 }
 
 func main() {
@@ -315,17 +274,17 @@ func main() {
 	writeEmbeddedFile(denoPath, denoBytes)
 
 	defer os.RemoveAll(tempDir)
-
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
-		fmt.Println("\n=======================")
-		fmt.Println("      PHONKER LOADER     ")
-		fmt.Println("=======================")
+		fmt.Println("\n=============================================")
+		fmt.Println("               PHONKER LOADER                ")
+		fmt.Println("=============================================")
 		fmt.Println("[1] Скачать контент (YouTube / Twitch)")
 		fmt.Println("[2] Открыть папку загрузок")
-		fmt.Println("[3] Посмотреть историю (текущая сессия)")
+		fmt.Println("[3] Посмотреть историю загрузок")
 		fmt.Println("[4] Выйти")
+		fmt.Println("=============================================")
 
 		fmt.Print("\nВведи номер действия: ")
 		choice, _ := reader.ReadString('\n')
@@ -336,24 +295,16 @@ func main() {
 			fmt.Print("\nВставь ссылку на видео: ")
 			url, _ := reader.ReadString('\n')
 			url = strings.TrimSpace(url)
-
 			if url == "" {
-				fmt.Println("Ошибка: пустая ссылка.")
 				continue
 			}
 
-			fmt.Println("\nВыбери качество:")
-			fmt.Println(" [1] Максимальное")
-			fmt.Println(" [2] 1080p")
-			fmt.Println(" [3] 720p")
-			fmt.Println(" [4] 480p")
-			fmt.Println(" [5] 360p")
+			fmt.Println("\nВыбери качество видео:")
+			fmt.Println(" [1] Максимальное\n [2] 1080p\n [3] 720p\n [4] 480p\n [5] 360p")
 			fmt.Print("Введи номер: ")
 			qChoice, _ := reader.ReadString('\n')
-			qChoice = strings.TrimSpace(qChoice)
-
 			quality := "best"
-			switch qChoice {
+			switch strings.TrimSpace(qChoice) {
 			case "2":
 				quality = "1080"
 			case "3":
@@ -364,51 +315,52 @@ func main() {
 				quality = "360"
 			}
 
-			title, maxDuration, err := downloadAndGetTitle(ytdlpPath, tempDir, denoPath, url, quality, "GET_INFO_ONLY")
-			if err != nil {
-				fmt.Printf("\nОшибка при получении метаданных: %v\n", err)
-				continue
-			}
+			fmt.Println("\n--- НАСТРОЙКА ТАЙМКОДОВ ---")
+			fmt.Print("Время НАЧАЛА (например: 0, 30, 1:15 или Enter чтобы скачать ВСЁ видео): ")
+			startIn, _ := reader.ReadString('\n')
+			startIn = strings.TrimSpace(startIn)
 
-			startZero := "00:00"
-			if len(maxDuration) > 5 {
-				startZero = "00:00:00"
-			}
-
-			fmt.Printf("\nНужно вырезать фрагмент? (Доступно: %s-%s)\n", startZero, maxDuration)
-			fmt.Print("Введите в формате *00:01:30-00:02:15 или нажмите Enter для полной загрузки: ")
-			timeRange, _ := reader.ReadString('\n')
-			timeRange = strings.TrimSpace(timeRange)
-
-			_, _, err = downloadAndGetTitle(ytdlpPath, tempDir, denoPath, url, quality, timeRange)
-			if err != nil {
-				fmt.Printf("\nОшибка при загрузке: %v\n", err)
+			var startTime, endTime string
+			if startIn != "" {
+				startTime = normalizeTime(startIn)
+				fmt.Print("Время ОКОНЧАНИЯ (например: 65 или 2:40): ")
+				endIn, _ := reader.ReadString('\n')
+				endTime = normalizeTime(endIn)
 			} else {
-				fmt.Println("\nЗагрузка успешно завершена!")
-				appendHistory(title, url) // Запись идет в ОЗУ
+				startTime = "" // Флаг для скачивания полного видео
+			}
+
+			title, err := downloadVideo(ytdlpPath, tempDir, denoPath, url, quality, startTime, endTime)
+			if err != nil {
+				fmt.Printf("\n[Ошибка] %v\n", err)
+			} else {
+				fmt.Println("\rЗагрузка успешно завершена!")
+				appendHistoryDirectly(title, url)
 			}
 
 		case "2":
-			openDownloads()
-			fmt.Println("\nПапка загрузок открыта.")
-
+			_ = exec.Command("explorer", "Downloads").Start()
 		case "3":
-			// Чтение происходит напрямую из глобального слайса в ОЗУ
-			if len(memoryHistory) == 0 {
-				fmt.Println("\nИстория текущей сессии пуста.")
+			history := readHistoryFromFile()
+			if len(history) == 0 {
+				fmt.Println("\nИстория пуста.")
 			} else {
-				fmt.Println("\n=== ИСТОРИЯ ЗАГРУЗОК (В ПАМЯТИ) ===")
-				for _, entry := range memoryHistory {
-					fmt.Printf("[%d] %s | %s\n    Ссылка: %s\n", entry.ID, entry.Date, entry.Title, entry.URL)
+				fmt.Println("\n=============================================")
+				fmt.Println("         ИСТОРИЯ ЗАГРУЗОК ИЗ JSON            ")
+				fmt.Println("=============================================")
+				for _, entry := range history {
+					fmt.Printf("[%d] %s в %s | %s\n Ссылка: %s\n", entry.ID, entry.Date, entry.Time, entry.Title, entry.URL)
 				}
+				fmt.Println("=============================================")
 			}
-
 		case "4":
-			fmt.Println("Выход из программы...")
 			return
-
-		default:
-			fmt.Println("Неверный ввод. Попробуйте еще раз.")
 		}
+	}
+}
+
+func writeEmbeddedFile(path string, data []byte) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		_ = os.WriteFile(path, data, 0755)
 	}
 }
